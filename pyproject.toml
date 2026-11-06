@@ -1,0 +1,31 @@
+[project]
+name = "consolidado"
+version = "0.1.0"
+description = "Consolidated YouTube MCP server — emerging channel discovery with composite filters"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0",
+    "google-api-python-client>=2.0",
+    "yt-dlp>=2024.0",
+    "feedparser>=6.0",
+    "youtube-transcript-api>=1.0",
+]
+
+[project.scripts]
+consolidado = "consolidado.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "consolidado"
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
