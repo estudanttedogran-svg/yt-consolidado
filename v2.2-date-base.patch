@@ -1,0 +1,110 @@
+diff --git a/src/youtube_dark_radar/engine.py b/src/youtube_dark_radar/engine.py
+index 5243489..9953fe2 100644
+--- a/src/youtube_dark_radar/engine.py
++++ b/src/youtube_dark_radar/engine.py
+@@ -26,9 +26,18 @@ class Radar:
+ 
+     def start(self,criteria=None):
+         doc=self.store.create_job(criteria)
++        # Freeze the age window when the research job is created. Verification may
++        # resume days later; its cutoff must not silently move between candidates.
++        doc["research_as_of"]=self.clock().isoformat()
++        self.store.save_job(doc)
+         return {"job_id":doc["job_id"],"status":doc["status"],"filters":doc["criteria"],
+                 "planned_searches":len(doc["plan"]),"next_action":"Call radar_continue_search repeatedly; no background worker runs."}
+ 
++    def _as_of(self,job):
++        # Jobs created before this fix lack research_as_of; use their original
++        # creation time, not the day an old job is resumed.
++        return parse_time(job.get("research_as_of") or job.get("created_at")) or self.clock()
++
+     def _src(self):
+         if self.source is None:
+             self.source=YouTubeSource(self.store)
+@@ -38,7 +47,7 @@ class Radar:
+         idx=job["plan_cursor"]
+         params=job["plan"][idx]
+         config=Criteria.parse(job["criteria"])
+-        cutoff=config.cutoff(self.clock())
++        cutoff=config.cutoff(self._as_of(job))
+         response=self._src().search(job["job_id"],params["query"],params["order"],
+                                     config.audience_region,config.language,cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
+         fresh=0
+@@ -119,7 +128,7 @@ class Radar:
+         playlist=((raw.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+         if not playlist:
+             return "pending",{**channel,"reason":"uploads_playlist_unavailable"}
+-        age=self._public_uploads(job["job_id"],playlist,config.cutoff(self.clock()),config.first_video_max_pages)
++        age=self._public_uploads(job["job_id"],playlist,config.cutoff(self._as_of(job)),config.first_video_max_pages)
+         channel["age_evidence"]={k:v for k,v in age.items() if k!="videos"}
+         if age["status"]=="older_than_cutoff":
+             return "rejected",{**channel,"reason":"older_public_video_observed"}
+@@ -127,7 +136,7 @@ class Radar:
+             return "pending",{**channel,"reason":"first_public_video_unproven"}
+         channel["first_public_video_published_at"]=age["first_video_published_at"]
+         channel["first_public_video_url"]="https://www.youtube.com/watch?v="+age["first_video_id"]
+-        channel["days_since_first_public_video"]=round((self.clock()-parse_time(age["first_video_published_at"])).total_seconds()/86400,2)
++        channel["days_since_first_public_video"]=round((self._as_of(job)-parse_time(age["first_video_published_at"])).total_seconds()/86400,2)
+         vids=[]
+         video_ids=list(dict.fromkeys(v["video_id"] for v in age["videos"]))
+         for offset in range(0,len(video_ids),50):
+@@ -364,6 +373,7 @@ class Radar:
+                 rejects["verification_error"]=rejects.get("verification_error",0)+1
+         requested=job["criteria"]["requested_channels"]
+         return {"schema_version":"0.2","job_id":job_id,"status":job["status"],
++                "research_as_of":self._as_of(job).isoformat(),
+                 "criteria":job["criteria"],"requested_channels":requested,
+                 "verified_or_likely_matches":len(matches),"channels":matches[:limit or requested],
+                 "pending_verification":pending[:20],"near_misses":near[:20],
+diff --git a/src/youtube_dark_radar/report.py b/src/youtube_dark_radar/report.py
+index 839ebe0..8bdac18 100644
+--- a/src/youtube_dark_radar/report.py
++++ b/src/youtube_dark_radar/report.py
+@@ -10,6 +10,7 @@ def markdown(result):
+     out=["# YouTube Dark Radar — Relatório", "",
+          f"**Job:** `{result['job_id']}`  |  **Status:** `{result['status']}`",
+          f"**Solicitados:** {result['requested_channels']}  |  **Encontrados:** {result['verified_or_likely_matches']}",
++         f"**Data-base da pesquisa:** {result.get('research_as_of','desconhecida')} (idade medida nesta data; visualizações são snapshots posteriores quando houver retomada)",
+          f"**Filtros:** `{json.dumps({k:config[k] for k in ('niche','first_public_video_max_age_days','subscriber_max','min_peak_views','language','faceless','duration_mode')},ensure_ascii=False)}`",
+          "", "| Canal | Primeiro vídeo público | Inscritos | Pico válido | Duração | Idioma | Dark |",
+          "|---|---|---:|---:|---:|---|---|"]
+diff --git a/tests/test_radar.py b/tests/test_radar.py
+index e61303e..eb6fd5b 100644
+--- a/tests/test_radar.py
++++ b/tests/test_radar.py
+@@ -299,3 +299,35 @@ def test_report_displays_total_near_misses_not_only_sample(build):
+     assert rep["candidate_counts"]["near_miss"]==25
+     assert len(rep["near_misses"])==20
+     assert "25 candidatos no total; 20 exibidos" in markdown(rep)
++
++
++def test_resume_uses_original_research_date_instead_of_current_clock(ready):
++    from datetime import timedelta
++    from conftest import NOW
++    r,s=ready
++    jid=job(r)
++    r.continue_job(jid,1)  # discover on Nov 7
++    assert r.status(jid)["searches_done"]==1
++    r.clock=lambda:NOW+timedelta(days=21)
++    finish(r,jid)
++    report=r.results(jid)
++    assert len(report["channels"])==1
++    assert report["channels"][0]["first_public_video_published_at"]==iso(3)
++    assert report["channels"][0]["days_since_first_public_video"]<14
++    assert report["research_as_of"].startswith("2026-11-07")
++    assert "Data-base da pesquisa" in markdown(report)
++
++
++def test_legacy_job_without_research_as_of_uses_created_at(ready):
++    from datetime import timedelta
++    from conftest import NOW
++    r,s=ready
++    jid=job(r)
++    state=r.store.get_job(jid)
++    state.pop("research_as_of")
++    state["created_at"]=NOW.isoformat()
++    r.store.save_job(state)
++    r.clock=lambda:NOW+timedelta(days=30)
++    finish(r,jid)
++    assert len(r.results(jid)["channels"])==1
++    assert r.results(jid)["research_as_of"].startswith("2026-11-07")
